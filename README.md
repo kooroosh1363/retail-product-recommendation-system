@@ -25,9 +25,9 @@ Portfolio-grade recommender-system project that converts historical retail purch
 
 The project uses the UCI **Online Retail** dataset with 541,909 raw invoice-line rows covering December 2010 through December 2011.
 
-Rows with missing CustomerID, cancellation invoices, non-positive quantity/price, and exact duplicates are removed before building implicit purchase interactions.
+The validated cleaning run removes 135,080 rows with missing CustomerID, 8,905 cancellation rows, 40 non-positive rows, and 5,192 exact duplicates, leaving 392,692 purchase rows from 4,338 identified customers across 3,665 products.
 
-The source ends on **2011-12-09 at 12:50**. That terminal date is excluded from temporal evaluation because it may represent only a partial trading day. Validation and test therefore use complete observed calendar-day windows ending on **2011-12-08**.
+The source ends on **2011-12-09 at 12:50**. That terminal date is excluded from temporal evaluation because it may represent only a partial trading day. This removes 610 terminal-day rows from the modeled windows and leaves **2011-12-08** as the final modeled day.
 
 See `DATA_SOURCE.md`, `DATA_DICTIONARY.md`, and `METHOD_CARD.md` for provenance, field definitions, evaluation rules, and limitations.
 
@@ -101,6 +101,37 @@ Top-K is fixed at `K=10`.
 - **Catalog Coverage@10** — share of the fitted catalog appearing in at least one recommendation list
 
 Model selection uses validation **NDCG@10** with **Recall@10** as a tie-breaker.
+
+## CI-validated validation results
+
+Validation contains 995 eligible known users with at least one rankable future novel item. The final audited ranking results are:
+
+| Model | Precision@10 | Recall@10 | Hit Rate@10 | NDCG@10 | Coverage@10 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Popular | 3.09% | 1.73% | 23.02% | 3.38% | 1.91% |
+| Recent Popular | 6.01% | 3.38% | 38.39% | 6.92% | 1.27% |
+| Item-KNN | 5.70% | 4.61% | 33.37% | 7.29% | 17.47% |
+| **TruncatedSVD** | **7.43%** | **5.85%** | **43.72%** | **9.02%** | **18.90%** |
+
+TruncatedSVD wins the validation policy on NDCG@10 and is therefore selected before the final test is opened.
+
+The validation audit also shows that about **42.72%** of known future purchase rows are repeat purchases of products already seen in training history. These are excluded from the novel-item ranking target rather than counted as impossible recommendation failures. Cold-start rows represent about **23.85%** of all validation future rows.
+
+## Final untouched test
+
+After model choice is locked, TruncatedSVD is refit on train plus validation and evaluated once on the final 28-day test window.
+
+- eligible users: **1,215**
+- Precision@10: **7.35%**
+- Recall@10: **5.70%**
+- Hit Rate@10: **43.05%**
+- NDCG@10: **9.18%**
+- Catalog Coverage@10: **19.15%**
+- cold-start future share: **14.74%**
+
+The test window contains 50,545 known-user/known-item future rows. Of these, 26,222 are rankable novel-item rows and 24,323 are repeat purchases of already-seen items, so roughly **48.12%** of known future purchase rows are repeat behavior rather than product discovery.
+
+These metrics are offline replay metrics. They should not be translated directly into CTR, conversion, revenue lift, or online user satisfaction.
 
 ## Cold-start policy
 
