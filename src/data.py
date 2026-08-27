@@ -60,10 +60,6 @@ def load_interactions() -> tuple[pd.DataFrame, dict]:
     work["customer_id"] = work["CustomerID"].astype("int64").astype(str)
     work["item_id"] = work["StockCode"].astype(str)
     work = work[["customer_id", "item_id", "InvoiceDate", "Quantity"]].rename(columns={"InvoiceDate": "timestamp"})
-
-    # One implicit event per customer-item-invoice-time line is retained; repeated quantity is
-    # represented later through interaction counts, while evaluation asks whether future items
-    # can be ranked, not how many units are purchased.
     work = work.sort_values("timestamp").reset_index(drop=True)
     audit.update({
         "clean_rows": int(len(work)),
@@ -76,15 +72,26 @@ def load_interactions() -> tuple[pd.DataFrame, dict]:
 
 
 def temporal_split(interactions: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict]:
-    # Global time cutoffs keep the recommender honest: no interaction after a cutoff can
-    # influence the model trained before it. Validation and test are the last 28 days each.
-    max_day = interactions["timestamp"].max().normalize()
+    # The public source terminates on 2011-12-09 at 12:50 rather than at a full
+    # end-of-day boundary. Exclude that terminal calendar date so the final
+    # offline evaluation window contains complete observed calendar days only.
+    source_last = interactions["timestamp"].max()
+    terminal_day = source_last.normalize()
+    terminal_excluded = source_last.time() != pd.Timestamp(source_last.date()).time()
+    modeling = interactions.copy()
+    excluded_terminal_rows = 0
+    if terminal_excluded:
+        terminal_mask = modeling["timestamp"].dt.normalize().eq(terminal_day)
+        excluded_terminal_rows = int(terminal_mask.sum())
+        modeling = modeling.loc[~terminal_mask].copy()
+
+    max_day = modeling["timestamp"].max().normalize()
     test_start = max_day - pd.Timedelta(days=27)
     val_start = test_start - pd.Timedelta(days=28)
 
-    train = interactions.loc[interactions["timestamp"] < val_start].copy()
-    val = interactions.loc[(interactions["timestamp"] >= val_start) & (interactions["timestamp"] < test_start)].copy()
-    test = interactions.loc[interactions["timestamp"] >= test_start].copy()
+    train = modeling.loc[modeling["timestamp"] < val_start].copy()
+    val = modeling.loc[(modeling["timestamp"] >= val_start) & (modeling["timestamp"] < test_start)].copy()
+    test = modeling.loc[modeling["timestamp"] >= test_start].copy()
 
     if train.empty or val.empty or test.empty:
         raise ValueError("Temporal split produced an empty partition")
@@ -92,6 +99,11 @@ def temporal_split(interactions: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFra
         raise ValueError("Temporal split ordering failed")
 
     meta = {
+        "source_last_timestamp": source_last.isoformat(),
+        "terminal_day_excluded_as_potentially_incomplete": bool(terminal_excluded),
+        "excluded_terminal_date": terminal_day.date().isoformat() if terminal_excluded else None,
+        "excluded_terminal_rows": excluded_terminal_rows,
+        "modeled_last_day": max_day.date().isoformat(),
         "validation_start": val_start.isoformat(),
         "test_start": test_start.isoformat(),
         "train_rows": int(len(train)),
