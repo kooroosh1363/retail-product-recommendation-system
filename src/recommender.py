@@ -69,21 +69,36 @@ def topk_from_scores(scores: np.ndarray, seen: np.ndarray, k: int = K) -> np.nda
 def evaluate(train: pd.DataFrame, future: pd.DataFrame, model_name: str) -> dict:
     matrix, users, items, uidx, iidx = build_matrix(train)
     catalog = set(items)
-    future_known = future.loc[future["item_id"].isin(catalog) & future["customer_id"].isin(uidx)].copy()
-    truths = future_known.groupby("customer_id")["item_id"].apply(lambda s: set(s)).to_dict()
+    known_user_mask = future["customer_id"].isin(uidx)
+    known_item_mask = future["item_id"].isin(catalog)
+    future_known = future.loc[known_user_mask & known_item_mask].copy()
+
+    # Recommendations intentionally exclude items already seen by each user in
+    # fitted history. Therefore ranking truth must evaluate the same task: new
+    # (previously unseen) future items. Repeat purchases of already-seen items
+    # are audited separately instead of being counted as impossible misses.
+    seen_pairs = set(zip(train["customer_id"], train["item_id"]))
+    pair_is_repeat = np.fromiter(
+        ((u, it) in seen_pairs for u, it in zip(future_known["customer_id"], future_known["item_id"])),
+        dtype=bool,
+        count=len(future_known),
+    )
+    repeat_seen_future_rows = int(pair_is_repeat.sum())
+    future_novel = future_known.loc[~pair_is_repeat].copy()
+
+    truths = future_novel.groupby("customer_id")["item_id"].apply(lambda s: set(s)).to_dict()
     eligible = sorted(truths)
     if not eligible:
-        raise ValueError("No eligible users for offline evaluation")
+        raise ValueError("No eligible users with rankable unseen future items")
 
     pop = popularity_scores(train, items)
     recent_pop = recent_popularity_scores(train, items)
     sim = None
-    svd = None
     user_factors = item_factors = None
     if model_name == "item_knn":
         sim = item_similarity(matrix)
     elif model_name == "svd":
-        svd, user_factors, item_factors = svd_scores(matrix)
+        _, user_factors, item_factors = svd_scores(matrix)
 
     hit_rates = []
     recalls = []
@@ -119,6 +134,10 @@ def evaluate(train: pd.DataFrame, future: pd.DataFrame, model_name: str) -> dict
         idcg = sum(1 / np.log2(rank + 2) for rank in range(ideal_hits))
         ndcgs.append(dcg / idcg if idcg else 0.0)
 
+    unseen_user_rows = int((~known_user_mask).sum())
+    unseen_item_rows_for_known_users = int((known_user_mask & ~known_item_mask).sum())
+    cold_start_rows = int(len(future) - len(future_known))
+
     return {
         "model": model_name,
         "eligible_users": len(eligible),
@@ -128,8 +147,13 @@ def evaluate(train: pd.DataFrame, future: pd.DataFrame, model_name: str) -> dict
         "ndcg_at_10": float(np.mean(ndcgs)),
         "catalog_coverage_at_10": float(len(recommended_items) / len(items)),
         "known_future_rows": int(len(future_known)),
-        "cold_start_future_rows": int(len(future) - len(future_known)),
-        "cold_start_future_share": float(1 - len(future_known) / len(future)) if len(future) else 0.0,
+        "novel_rankable_future_rows": int(len(future_novel)),
+        "repeat_seen_future_rows": repeat_seen_future_rows,
+        "repeat_seen_future_share_of_known": float(repeat_seen_future_rows / len(future_known)) if len(future_known) else 0.0,
+        "unseen_user_future_rows": unseen_user_rows,
+        "unseen_item_future_rows_for_known_users": unseen_item_rows_for_known_users,
+        "cold_start_future_rows": cold_start_rows,
+        "cold_start_future_share": float(cold_start_rows / len(future)) if len(future) else 0.0,
     }
 
 
@@ -171,13 +195,14 @@ def main() -> None:
             "top_k": K,
             "selection_metric": "validation NDCG@10 with Recall@10 tie-break",
             "candidate_models": candidates,
-            "seen_item_policy": "items observed for the user in training are excluded from recommendations",
+            "seen_item_policy": "items observed for the user in fitted history are excluded from recommendations",
+            "relevance_policy": "ranking metrics use future catalog items not previously seen by that user; repeat purchases are audited separately",
             "cold_start_policy": "future rows for unseen users/items are not rankable by collaborative models and are reported separately",
         },
         "validation_results": val_results.to_dict(orient="records"),
         "selected_model": selected,
         "test_result": test_result,
-        "claim_boundary": "offline historical ranking evaluation; no guarantee of online CTR, conversion, revenue, or causal lift",
+        "claim_boundary": "offline historical novel-item ranking evaluation; no guarantee of online CTR, conversion, revenue, or causal lift",
     }
     (ART / "metrics.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
     print(json.dumps(report, indent=2))
